@@ -1039,7 +1039,7 @@
 
 /*ESP32_2432S028R enable*/
 /*Interface for TFT_eSPI*/
-#define LV_USE_TFT_ESPI         1
+#define LV_USE_TFT_ESPI         0
 
 /*Driver for evdev input devices*/
 #define LV_USE_EVDEV    0

@@ -1,84 +1,57 @@
-// Kafkar.com
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "lvgl.h"
+#include "touch_xpt2046.h"
 
-#include <Arduino.h>
-#include <SPI.h>
+static const char *TAG = "main";
 
-// include the installed LVGL- Light and Versatile Graphics Library - https://github.com/lvgl/lvgl
-#include <lvgl.h>
+// Pin Definitions
+#define LCD_HOST  SPI2_HOST
+#define PIN_NUM_MISO 12
+#define PIN_NUM_MOSI 13
+#define PIN_NUM_CLK  14
+#define PIN_NUM_CS   15
+#define PIN_NUM_DC   2
+#define PIN_NUM_RST  -1
+#define PIN_NUM_BCKL 21
 
-// include the installed "TFT_eSPI" library by Bodmer to interface with the TFT Display - https://github.com/Bodmer/TFT_eSPI
-#include <TFT_eSPI.h>
+#define TOUCH_CS 33
+#define TOUCH_IRQ 36
 
-// include the installed the "XPT2046_Touchscreen" library by Paul Stoffregen to use the Touchscreen - https://github.com/PaulStoffregen/XPT2046_Touchscreen
-#include <XPT2046_Touchscreen.h>
+// PWM for Backlight
+#define LCD_BCKL_ON_LEVEL  1
+#define LCD_BCKL_OFF_LEVEL !LCD_BCKL_ON_LEVEL
 
+// LVGL
+#define LVGL_DRAW_BUF_SIZE (240 * 10 * 2) // 10 lines, 2 bytes per pixel
 
-// Create a instance of the TFT_eSPI class
-TFT_eSPI tft = TFT_eSPI();
-
-// Set the pius of the xpt2046 touchscreen
-#define XPT2046_IRQ 36  // T_IRQ
-#define XPT2046_MOSI 32 // T_DIN
-#define XPT2046_MISO 39 // T_OUT
-#define XPT2046_CLK 25  // T_CLK
-#define XPT2046_CS 33   // T_CS
-
-// Create a instance of the SPIClass and XPT2046_Touchscreen classes
-SPIClass touchscreenSPI = SPIClass(VSPI);
-XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
-
-// Define the size of the TFT display
-#define SCREEN_WIDTH 240
-#define SCREEN_HEIGHT 320
-
-// Define the size of the buffer for the TFT display
-#define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * (LV_COLOR_DEPTH / 8))
-
-// Touchscreen coordinates: (x, y) and pressure (z)
-int x, y, z;
-
-// Create variables for the LVGL objects
+// Global objects
+Xpt2046 *touch_driver = nullptr;
 lv_obj_t *led1;
 lv_obj_t *led3;
 lv_obj_t * btn_label;
-
-// Create a variable to store the LED state
+static lv_obj_t * slider_label;
 bool ledsOff = false;
 bool rightLedOn = true;
 
-// Create a buffer for drawing
-uint32_t draw_buf[DRAW_BUF_SIZE / 4];
+// -------------------------------------------------------------------------
+// LVGL Callbacks & UI
+// -------------------------------------------------------------------------
 
-
-// Get the Touchscreen data
-void touchscreen_read(lv_indev_t * indev, lv_indev_data_t * data) {
-  // Checks if Touchscreen was touched, and prints X, Y and Pressure (Z)
-  if(touchscreen.tirqTouched() && touchscreen.touched()) {
-    // Get Touchscreen points
-    TS_Point p = touchscreen.getPoint();
-    // Calibrate Touchscreen points with map function to the correct width and height
-    x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
-    y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
-    z = p.z;
-
-    data->state = LV_INDEV_STATE_PRESSED;
-
-    // Set the coordinates
-    data->point.x = x;
-    data->point.y = y;
-  }
-  else {
-    data->state = LV_INDEV_STATE_RELEASED;
-  }
-}
-
-
-// Callback that is triggered when btn2 is clicked/toggled
 static void event_handler_btn2(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   lv_obj_t * obj = (lv_obj_t*) lv_event_get_target(e);
   if(code == LV_EVENT_VALUE_CHANGED) {
-    LV_UNUSED(obj);
     if(ledsOff==true){
       if(lv_obj_has_state(obj, LV_STATE_CHECKED)==true) 
       {
@@ -94,7 +67,6 @@ static void event_handler_btn2(lv_event_t *e) {
         lv_label_set_text(btn_label, "Right");
         rightLedOn = false;
       }
-      //LV_LOG_USER("Toggled %s", lv_obj_has_state(obj, LV_STATE_CHECKED) ? "on" : "off");
     }
   }
 }
@@ -104,7 +76,6 @@ static void event_handler(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * obj = (lv_obj_t*)lv_event_get_target(e);
     if(code == LV_EVENT_VALUE_CHANGED) {
-        LV_UNUSED(obj);
         if(lv_obj_has_state(obj, LV_STATE_CHECKED)==true)
         {
           if(rightLedOn==true)
@@ -125,13 +96,9 @@ static void event_handler(lv_event_t *e)
           lv_led_off(led3);
           ledsOff = false;
         }
-        //LV_LOG_USER("State: %s\n", lv_obj_has_state(obj, LV_STATE_CHECKED) ? "On" : "Off");
     }
 }
 
-
-static lv_obj_t * slider_label;
-// Callback that prints the current slider value on the TFT display and Serial Monitor for debugging purposes
 static void slider_event_callback(lv_event_t * e) {
   lv_obj_t * slider = (lv_obj_t*) lv_event_get_target(e);
   char buf[8];
@@ -140,11 +107,7 @@ static void slider_event_callback(lv_event_t * e) {
   lv_obj_align_to(slider_label, slider, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 }
 
-
 void lv_create_main_gui(void) {
-
-
-
   /*Create a LED and switch it OFF*/
   led1  = lv_led_create(lv_screen_active());
   lv_obj_align(led1, LV_ALIGN_CENTER, -100, 0);
@@ -152,7 +115,6 @@ void lv_create_main_gui(void) {
   lv_led_set_color(led1, lv_palette_main(LV_PALETTE_LIGHT_GREEN));
   lv_led_off(led1);
 
- 
   /*Copy the previous LED and switch it ON*/
   led3  = lv_led_create(lv_screen_active());
   lv_obj_align(led3, LV_ALIGN_CENTER, 100, 0);
@@ -167,7 +129,6 @@ void lv_create_main_gui(void) {
   lv_obj_set_width(text_label, 150);    // Set smaller width to make the lines wrap
   lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(text_label, LV_ALIGN_CENTER, 0, -90);
-
 
   lv_obj_t * sw;
 
@@ -201,41 +162,181 @@ void lv_create_main_gui(void) {
   lv_obj_align_to(slider_label, slider, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 }
 
-void setup() {
-  String LVGL_Arduino = String("LVGL Library Version: ") + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch();
-  Serial.begin(115200);
-  Serial.println(LVGL_Arduino);
-  
-  // Start LVGL
-  lv_init();
+// -------------------------------------------------------------------------
+// Display Flushing
+// -------------------------------------------------------------------------
 
-  // Start the SPI for the touchscreen and init the touchscreen
-  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-  touchscreen.begin(touchscreenSPI);
-  // Set the Touchscreen rotation in landscape mode
-  // Note: in some displays, the touchscreen might be upside down, so you might need to set the rotation to 0: touchscreen.setRotation(0);
-  touchscreen.setRotation(2);
-
-  // Create a display object
-  lv_display_t *disp;
-
-  // Initialize the TFT display using the TFT_eSPI library
-  disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
-  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
-    
-  // Initialize an LVGL input device object (Touchscreen)
-  lv_indev_t *indev = lv_indev_create();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-
-  // Set the callback function to read Touchscreen input
-  lv_indev_set_read_cb(indev, touchscreen_read);
-
-  // Function to draw the GUI (text, buttons and sliders)
-  lv_create_main_gui();
+static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    lv_display_t *disp = (lv_display_t *)user_ctx;
+    lv_display_flush_ready(disp);
+    return false;
 }
 
-void loop() {
-  lv_task_handler();  // let the GUI do its work
-  lv_tick_inc(5);     // tell LVGL how much time has passed
-  delay(5);           // let this time pass
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
+    int x1 = area->x1;
+    int x2 = area->x2;
+    int y1 = area->y1;
+    int y2 = area->y2;
+    // Because SPI is LSB first but we want MSB first for 8-bit command, but data?
+    // esp_lcd_panel_draw_bitmap handles endianness usually if configured correctly.
+    // However, LVGL sends bytes. If color depth is 16, it's 2 bytes per pixel.
+    esp_lcd_panel_draw_bitmap(panel_handle, x1, y1, x2 + 1, y2 + 1, px_map);
+}
+
+// -------------------------------------------------------------------------
+// Touch Read
+// -------------------------------------------------------------------------
+static void lvgl_touch_read(lv_indev_t * indev, lv_indev_data_t * data) {
+    uint16_t x = 0, y = 0, z = 0;
+    if (touch_driver && touch_driver->read_raw(&x, &y, &z)) {
+        data->state = LV_INDEV_STATE_PRESSED;
+        // Calibrate or map if needed.
+        // Raw X: ~200-3700, Y: 240-3800 -> Screen 240x320
+        
+        // Simple linear map
+        long lcd_x = (long)(3700 - x) * 240 / (3700 - 200);
+        long lcd_y = (long)(y - 240) * 320 / (3800 - 240);
+
+        if (lcd_x < 0) lcd_x = 0;
+        if (lcd_y < 0) lcd_y = 0;
+        if (lcd_x > 240) lcd_x = 240;
+        if (lcd_y > 320) lcd_y = 320;
+        
+        data->point.x = (int16_t)lcd_x;
+        data->point.y = (int16_t)lcd_y;
+        
+        // Debug: Print Mapped Coordinates
+        // printf("Touch: Raw(%d, %d) -> Mapped(%d, %d)\n", x, y, (int)lcd_x, (int)lcd_y);
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+
+// -------------------------------------------------------------------------
+// Main
+// -------------------------------------------------------------------------
+
+// Tick timer callback
+static void lv_tick_task(void *arg) {
+    lv_tick_inc(1);
+}
+
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting CYD LVGL ESP-IDF");
+
+    // Initialize timer for LVGL
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &lv_tick_task,
+        .name = "periodic_gui"
+    };
+    esp_timer_handle_t periodic_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 1000)); // 1ms
+
+    // Initialize LVGL first
+    lv_init();
+
+    lv_display_t *disp = lv_display_create(240, 320); // 240x320 physical
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+
+    // -------------------------------------------------------------------------
+    // LCD SPI (SPI2)
+    // -------------------------------------------------------------------------
+    spi_bus_config_t buscfg = {};
+    buscfg.sclk_io_num = PIN_NUM_CLK;
+    buscfg.mosi_io_num = PIN_NUM_MOSI;
+    buscfg.miso_io_num = PIN_NUM_MISO;
+    buscfg.quadwp_io_num = -1;
+    buscfg.quadhd_io_num = -1;
+    buscfg.max_transfer_sz = 240 * 320 * 2 + 8; 
+
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    // Initialize Control Pins
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {};
+    io_config.dc_gpio_num = PIN_NUM_DC;
+    io_config.cs_gpio_num = PIN_NUM_CS;
+    io_config.pclk_hz = 40 * 1000 * 1000; // 40 MHz
+    io_config.lcd_cmd_bits = 8;
+    io_config.lcd_param_bits = 8;
+    io_config.spi_mode = 0;
+    io_config.trans_queue_depth = 10;
+    io_config.on_color_trans_done = notify_lvgl_flush_ready; // Callback for LVGL
+    io_config.user_ctx = disp; // Pass the display handle
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
+
+    esp_lcd_panel_handle_t panel_handle = NULL;
+    esp_lcd_panel_dev_config_t panel_config = {};
+    panel_config.reset_gpio_num = PIN_NUM_RST;
+    panel_config.rgb_endian = LCD_RGB_ENDIAN_BGR; // ST7789 often BGR
+    panel_config.bits_per_pixel = 16;
+    
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
+    
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    
+    // Set rotation/mirror
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
+    
+    // Invert Colors (Fixes "off" colors)
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+    // Backlight
+    gpio_set_direction((gpio_num_t)PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PIN_NUM_BCKL, LCD_BCKL_ON_LEVEL);
+
+    // -------------------------------------------------------------------------
+    // Touch SPI (SPI3)
+    // -------------------------------------------------------------------------
+    // CYD Touch Pins: CLK=25, MOSI=32, MISO=39, CS=33
+    spi_bus_config_t touch_buscfg = {};
+    touch_buscfg.sclk_io_num = 25;
+    touch_buscfg.mosi_io_num = 32;
+    touch_buscfg.miso_io_num = 39;
+    touch_buscfg.quadwp_io_num = -1;
+    touch_buscfg.quadhd_io_num = -1;
+    touch_buscfg.max_transfer_sz = 100; // Small transfers
+
+    // Use SPI3_HOST for Touch
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &touch_buscfg, SPI_DMA_CH_AUTO));
+
+    // Initialize Touch
+    touch_driver = new Xpt2046(SPI3_HOST, TOUCH_CS, TOUCH_IRQ);
+    if (!touch_driver->init()) {
+        ESP_LOGE(TAG, "Touch init failed");
+    }
+
+    // Allocate draw buffers
+    uint8_t *buf1 = (uint8_t*)heap_caps_malloc(LVGL_DRAW_BUF_SIZE, MALLOC_CAP_DMA);
+    uint8_t *buf2 = (uint8_t*)heap_caps_malloc(LVGL_DRAW_BUF_SIZE, MALLOC_CAP_DMA);
+    lv_display_set_buffers(disp, buf1, buf2, LVGL_DRAW_BUF_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    
+    lv_display_set_flush_cb(disp, lvgl_flush_cb);
+    lv_display_set_user_data(disp, panel_handle);
+
+    // Touch Input
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, lvgl_touch_read);
+    lv_indev_set_display(indev, disp); // Explicitly attach to display
+
+    // Create GUI
+    lv_create_main_gui();
+
+    int loop_count = 0;
+    while (1) {
+        lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
